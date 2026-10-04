@@ -1,16 +1,123 @@
-# React + Vite
+# Ergonomics Vision Monitor
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+A computer ergonomics monitoring application that uses a webcam and local vision AI to analyze visible posture.
 
-Currently, two official plugins are available:
+## 🚧 Project Status
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+**Current status:** Working prototype
 
-## React Compiler
+The current version can:
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+* Upload an image for AI analysis
+* Connect to a local Qwen3-VL vision API
+* Access the laptop webcam
+* Select an available camera device
+* Show a live camera preview
+* Capture a frame from the webcam
+* Display the captured image
+* Handle camera permission errors
 
-## Expanding the Oxlint configuration
+## 🧠 AI System
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and Oxlint's TypeScript related rules in your project.
+The project uses:
+
+* **Unsloth**
+* **Qwen3-VL-4B-Instruct-GGUF**
+
+The vision model runs through a local OpenAI-compatible API.
+
+### Current API
+
+```text
+http://127.0.0.1:8888/v1/chat/completions
+```
+
+The React application sends uploaded images to the local vision API and receives an ergonomics analysis.
+
+## 📷 Webcam System
+
+The application uses:
+
+* **react-webcam**
+* Browser camera APIs
+
+The current camera flow is:
+
+```text
+Start Camera
+      ↓
+Select Camera
+      ↓
+Live Webcam Preview
+      ↓
+Capture Image
+      ↓
+Captured Image
+```
+
+The captured image is currently stored as a browser data URL.
+
+**The captured webcam image is not automatically sent to the AI yet.**
+
+## 🖥️ Technology Stack
+
+* React
+* Vite
+* JavaScript
+* react-webcam
+* Unsloth
+* Qwen3-VL
+
+## 📁 Project Structure
+
+```text
+src/
+├── services/
+│   └── aiService.js
+│
+├── App.jsx
+├── App.css
+├── index.css
+└── main.jsx
+
+public/
+```
+
+## 🔐 Security
+
+API tokens and other secrets should never be committed to GitHub.
+
+The local AI API is currently intended for development and testing.
+
+## 🚀 Running the Project
+
+Install dependencies:
+
+```bash
+npm install
+```
+
+Start the development server:
+
+```bash
+npm run dev
+```
+
+The application will then be available through the local Vite development server.
+
+## 🛣️ Future Plans
+
+Planned features include:
+
+* Automatic camera-based analysis
+* Periodic posture monitoring
+* Ergonomics monitoring dashboard
+* Posture history
+* More detailed monitoring results
+* Additional ergonomics features
+
+## 📌 Current Development Approach
+
+The project is being developed incrementally.
+
+Each major feature is tested independently before being connected to the rest of the system.
