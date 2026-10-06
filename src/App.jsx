@@ -1,10 +1,35 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import Webcam from 'react-webcam';
 import { analyzeImage } from './services/aiService';
 import './App.css';
 
 const MONITOR_INTERVAL = 10000;
 const ALERT_COOLDOWN = 2 * 60 * 1000;
+const DEFAULT_SESSION_MINUTES = 25;
+
+const MODES = {
+  focus: {
+    name: 'Focus',
+    description: 'Balanced monitoring with gentle audio reminders.',
+    accent: 'blue',
+    minutes: 25,
+    checks: true,
+  },
+  study: {
+    name: 'Study',
+    description: 'Deep-work mode with stronger intervention and full-screen enforcement.',
+    accent: 'violet',
+    minutes: 50,
+    checks: true,
+  },
+  calm: {
+    name: 'Calm',
+    description: 'Low-pressure mode for reading, planning, and light work.',
+    accent: 'green',
+    minutes: 15,
+    checks: false,
+  },
+};
 
 function App() {
   const [theme, setTheme] = useState(() => {
@@ -22,7 +47,6 @@ function App() {
   const [capturedImage, setCapturedImage] = useState(null);
   const [capturedResult, setCapturedResult] = useState(null);
   const [capturedAnalyzing, setCapturedAnalyzing] = useState(false);
-
   const [cameras, setCameras] = useState([]);
   const [selectedCameraId, setSelectedCameraId] = useState('');
 
@@ -30,23 +54,66 @@ function App() {
   const [monitorStatus, setMonitorStatus] = useState('Waiting');
   const [lastAnalysisTime, setLastAnalysisTime] = useState(null);
   const [nextAnalysisAt, setNextAnalysisAt] = useState(null);
-
-  const [analysisHistory, setAnalysisHistory] = useState([]);
+  const [analysisHistory, setAnalysisHistory] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem('ergoai-history') || '[]');
+    } catch {
+      return [];
+    }
+  });
   const [activeAlert, setActiveAlert] = useState(null);
-
   const [aiStatus, setAiStatus] = useState('checking');
   const [aiTesting, setAiTesting] = useState(false);
+
+  // Features
+  const [mode, setMode] = useState(() => localStorage.getItem('ergoai-mode') || 'focus');
+  const [sessionMinutes, setSessionMinutes] = useState(() =>
+    Number(localStorage.getItem('ergoai-session-minutes')) || DEFAULT_SESSION_MINUTES
+  );
+  const [sessionSecondsLeft, setSessionSecondsLeft] = useState(0);
+  const [sessionActive, setSessionActive] = useState(false);
+  const [sessionStartedAt, setSessionStartedAt] = useState(null);
+  const [completedSessions, setCompletedSessions] = useState(() =>
+    Number(localStorage.getItem('ergoai-completed-sessions')) || 0
+  );
+  const [focusPoints, setFocusPoints] = useState(() =>
+    Number(localStorage.getItem('ergoai-focus-points')) || 0
+  );
+  const [tiredLevel, setTiredLevel] = useState(0);
+  const [selfEnergy, setSelfEnergy] = useState(() =>
+    Number(localStorage.getItem('ergoai-energy')) || 70
+  );
+  const [soundEnabled, setSoundEnabled] = useState(
+    () => localStorage.getItem('ergoai-sound') !== 'false'
+  );
+  const [soundVolume, setSoundVolume] = useState(
+    () => Number(localStorage.getItem('ergoai-volume')) || 0.45
+  );
+  const [fullscreenStudy, setFullscreenStudy] = useState(false);
+  const [sessionLog, setSessionLog] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem('ergoai-session-log') || '[]');
+    } catch {
+      return [];
+    }
+  });
 
   const webcamRef = useRef(null);
   const monitoringIntervalRef = useRef(null);
   const countdownIntervalRef = useRef(null);
+  const sessionIntervalRef = useRef(null);
   const analysisInProgressRef = useRef(false);
   const monitoringRef = useRef(false);
   const aiTestControllerRef = useRef(null);
+  const audioContextRef = useRef(null);
+  const sessionActiveRef = useRef(false);
+  const sessionStartedRef = useRef(null);
 
   const alertCooldownsRef = useRef({
     slouching: 0,
     eyesClosed: 0,
+    distracted: 0,
+    tired: 0,
     combined: 0,
   });
 
@@ -55,151 +122,144 @@ function App() {
     localStorage.setItem('ergoai-theme', theme);
   }, [theme]);
 
+  useEffect(() => {
+    localStorage.setItem('ergoai-history', JSON.stringify(analysisHistory.slice(0, 40)));
+  }, [analysisHistory]);
+
+  useEffect(() => {
+    localStorage.setItem('ergoai-mode', mode);
+    localStorage.setItem('ergoai-session-minutes', String(sessionMinutes));
+  }, [mode, sessionMinutes]);
+
+  useEffect(() => {
+    localStorage.setItem('ergoai-completed-sessions', String(completedSessions));
+    localStorage.setItem('ergoai-focus-points', String(focusPoints));
+  }, [completedSessions, focusPoints]);
+
+  useEffect(() => {
+    localStorage.setItem('ergoai-energy', String(selfEnergy));
+    localStorage.setItem('ergoai-sound', String(soundEnabled));
+    localStorage.setItem('ergoai-volume', String(soundVolume));
+  }, [selfEnergy, soundEnabled, soundVolume]);
+
+  useEffect(() => {
+    localStorage.setItem('ergoai-session-log', JSON.stringify(sessionLog.slice(0, 30)));
+  }, [sessionLog]);
+
+  useEffect(() => {
+    sessionActiveRef.current = sessionActive;
+    sessionStartedRef.current = sessionStartedAt;
+  }, [sessionActive, sessionStartedAt]);
+
+  useEffect(() => {
+    loadCameras();
+    return () => {
+      clearAllTimers();
+      if (aiTestControllerRef.current) aiTestControllerRef.current.abort();
+      const video = webcamRef.current?.video;
+      const stream = video?.srcObject;
+      if (stream) stream.getTracks().forEach((track) => track.stop());
+      if (audioContextRef.current) audioContextRef.current.close().catch(() => {});
+    };
+  }, []);
+
+  const currentMode = MODES[mode] || MODES.focus;
+
+  const clearAllTimers = () => {
+    if (monitoringIntervalRef.current) clearInterval(monitoringIntervalRef.current);
+    if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
+    if (sessionIntervalRef.current) clearInterval(sessionIntervalRef.current);
+    monitoringIntervalRef.current = null;
+    countdownIntervalRef.current = null;
+    sessionIntervalRef.current = null;
+  };
+
   const loadCameras = async () => {
     try {
       if (!navigator.mediaDevices?.enumerateDevices) {
         throw new Error('Camera device enumeration is not supported by this browser.');
       }
-
       const devices = await navigator.mediaDevices.enumerateDevices();
       const videoDevices = devices.filter((device) => device.kind === 'videoinput');
       setCameras(videoDevices);
 
-      if (!selectedCameraId && videoDevices.length > 0) {
-        const preferredCamera =
-          videoDevices.find((device) => {
-            const label = device.label.toLowerCase();
-            return ['integrated', 'built-in', 'internal', 'laptop', 'hd camera', 'hd webcam', 'webcam']
-              .some((name) => label.includes(name));
-          }) || videoDevices[0];
-
-        setSelectedCameraId(preferredCamera.deviceId);
+      if (!selectedCameraId && videoDevices.length) {
+        const preferred =
+          videoDevices.find((device) =>
+            ['integrated', 'built-in', 'internal', 'laptop', 'hd camera', 'webcam']
+              .some((name) => device.label.toLowerCase().includes(name))
+          ) || videoDevices[0];
+        setSelectedCameraId(preferred.deviceId);
       }
     } catch (err) {
-      console.error('Could not enumerate cameras:', err);
-      setError('Could not list your cameras. Please check browser camera permissions.');
+      console.error(err);
+      setError('Could not list your cameras. Check browser camera permissions.');
     }
   };
 
-  useEffect(() => {
-    loadCameras();
-
-    return () => {
-      if (monitoringIntervalRef.current) clearInterval(monitoringIntervalRef.current);
-      if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
-      if (aiTestControllerRef.current) aiTestControllerRef.current.abort();
-
-      monitoringRef.current = false;
-
-      const video = webcamRef.current?.video;
-      const stream = video?.srcObject;
-      if (stream) stream.getTracks().forEach((track) => track.stop());
-    };
-  }, []);
-
   const handleStartCamera = async () => {
     setError(null);
-
     try {
       const permissionStream = await navigator.mediaDevices.getUserMedia({
         video: true,
         audio: false,
       });
-
       permissionStream.getTracks().forEach((track) => track.stop());
       await loadCameras();
-
       setCameraStarting(true);
       setCameraRunning(false);
     } catch (err) {
-      console.error('Camera permission error:', err);
+      console.error(err);
       setCameraStarting(false);
       setCameraRunning(false);
-      setError('Camera access was denied or unavailable. Please allow camera permission for this site and try again.');
-
-      if (monitoringRef.current) {
-        monitoringRef.current = false;
-        resetAlertCooldowns();
-        setActiveAlert(null);
-        setMonitoring(false);
-        setMonitorStatus('Error');
-      }
+      setError('Camera access was denied or unavailable. Allow camera permission and try again.');
     }
   };
 
   const handleCameraReady = () => {
     setCameraStarting(false);
     setCameraRunning(true);
-    setAiStatus((current) => current);
     setError(null);
   };
 
   const handleCameraError = (cameraError) => {
-    console.error('Webcam error:', cameraError);
+    console.error(cameraError);
     setCameraStarting(false);
     setCameraRunning(false);
-    setError('The selected camera could not be opened. Try selecting another camera.');
-
-    if (monitoringRef.current) {
-      monitoringRef.current = false;
-      setMonitoring(false);
-      setMonitorStatus('Error');
-    }
+    setError('The selected camera could not be opened. Try another camera.');
+    if (monitoringRef.current) stopMonitoring();
   };
 
   const handleStopCamera = () => {
     const video = webcamRef.current?.video;
     const stream = video?.srcObject;
-
     if (stream) {
       stream.getTracks().forEach((track) => track.stop());
       video.srcObject = null;
     }
-
     setCameraStarting(false);
     setCameraRunning(false);
-
-    if (monitoringRef.current) {
-      monitoringRef.current = false;
-      setMonitoring(false);
-      setMonitorStatus('Waiting');
-      if (monitoringIntervalRef.current) clearInterval(monitoringIntervalRef.current);
-      monitoringIntervalRef.current = null;
-      if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
-      countdownIntervalRef.current = null;
-      setNextAnalysisAt(null);
-    }
-
-    setError(null);
+    if (monitoringRef.current) stopMonitoring();
   };
 
   const handleCameraChange = (event) => {
     const newCameraId = event.target.value;
-
     if (cameraRunning || cameraStarting) {
       const video = webcamRef.current?.video;
       const stream = video?.srcObject;
-
-      if (stream) {
-        stream.getTracks().forEach((track) => track.stop());
-        if (video) video.srcObject = null;
-      }
-
+      if (stream) stream.getTracks().forEach((track) => track.stop());
+      if (video) video.srcObject = null;
       setCameraRunning(false);
       setCameraStarting(false);
     }
-
     setSelectedCameraId(newCameraId);
     setError(null);
   };
 
-  const captureCurrentFrame = () => {
-    if (!webcamRef.current) return null;
-    return webcamRef.current.getScreenshot() || null;
-  };
+  const captureCurrentFrame = () => webcamRef.current?.getScreenshot() || null;
 
   const addAnalysisToHistory = (data, timestamp = new Date()) => {
-    const historyEntry = {
+    const entry = {
       timestamp,
       person_visible: data?.person_visible,
       sitting: data?.sitting,
@@ -208,105 +268,156 @@ function App() {
       eyes: data?.eyes,
       description: data?.description,
     };
-
-    setAnalysisHistory((previous) => [historyEntry, ...previous].slice(0, 20));
+    setAnalysisHistory((previous) => [entry, ...previous].slice(0, 40));
   };
 
   const resetAlertCooldowns = () => {
-    alertCooldownsRef.current = { slouching: 0, eyesClosed: 0, combined: 0 };
+    alertCooldownsRef.current = {
+      slouching: 0,
+      eyesClosed: 0,
+      distracted: 0,
+      tired: 0,
+      combined: 0,
+    };
   };
 
-  const maybeShowSmartAlert = (data) => {
+  const ensureAudio = async () => {
+    if (!soundEnabled) return null;
+    try {
+      if (!audioContextRef.current) {
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        if (!AudioCtx) return null;
+        audioContextRef.current = new AudioCtx();
+      }
+      if (audioContextRef.current.state === 'suspended') {
+        await audioContextRef.current.resume();
+      }
+      return audioContextRef.current;
+    } catch {
+      return null;
+    }
+  };
+
+  const playReminderSound = async (kind = 'gentle') => {
+    const ctx = await ensureAudio();
+    if (!ctx) return;
+
+    const now = ctx.currentTime;
+    const gain = ctx.createGain();
+    const osc = ctx.createOscillator();
+    osc.type = kind === 'tired' ? 'sine' : 'triangle';
+    osc.frequency.setValueAtTime(kind === 'focus' ? 660 : 520, now);
+    osc.frequency.exponentialRampToValueAtTime(kind === 'tired' ? 380 : 440, now + 0.32);
+    gain.gain.setValueAtTime(Math.max(0.01, soundVolume * 0.18), now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.55);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(now);
+    osc.stop(now + 0.58);
+  };
+
+  const showSmartAlert = async (data) => {
     if (!monitoringRef.current || !data) return;
 
     const slouching = data.slouching === true;
     const eyesClosed = data.eyes === 'closed';
-    if (!slouching && !eyesClosed) return;
+    const noPerson = data.person_visible === false;
+
+    let level = 0;
+    if (slouching) level += 35;
+    if (eyesClosed) level += 45;
+    if (noPerson) level += 35;
+    if (String(data.head_position || '').toLowerCase().includes('down')) level += 25;
+
+    setTiredLevel((previous) => {
+      const target = Math.min(100, Math.max(previous * 0.72, level));
+      return Math.round(target);
+    });
+
+    if (!slouching && !eyesClosed && !noPerson) return;
 
     const now = Date.now();
-    let alertType;
-    let title;
-    let message;
+    let type = 'slouching';
+    let title = 'Refocus gently';
+    let message = 'Reset your posture and bring your attention back to the task.';
+    let sound = 'gentle';
 
-    if (slouching && eyesClosed) {
-      alertType = 'combined';
-      title = 'Gentle break reminder';
-      message = 'The latest check suggests adjusting your sitting position and taking a short break if you feel tired.';
-    } else if (slouching) {
-      alertType = 'slouching';
-      title = 'Posture reminder';
-      message = 'The latest check suggests sitting a little more upright.';
-    } else {
-      alertType = 'eyesClosed';
-      title = 'Break reminder';
-      message = 'Your eyes appear closed. Consider taking a short break if you feel tired.';
+    if (eyesClosed && slouching) {
+      type = 'combined';
+      title = 'You may need a break';
+      message = 'Your posture and eye cues suggest fatigue. Take 60 seconds to reset.';
+      sound = 'tired';
+    } else if (eyesClosed) {
+      type = 'eyesClosed';
+      title = 'Eye break';
+      message = 'Look away from the screen for a few seconds and relax your eyes.';
+      sound = 'tired';
+    } else if (noPerson) {
+      type = 'distracted';
+      title = mode === 'study' ? 'Study mode: return to your desk' : 'Where did you go?';
+      message = 'The camera cannot see you. Return when you are ready to continue.';
+      sound = 'focus';
     }
 
-    const lastShown = alertCooldownsRef.current[alertType] || 0;
+    const lastShown = alertCooldownsRef.current[type] || 0;
     if (now - lastShown < ALERT_COOLDOWN) return;
 
-    alertCooldownsRef.current[alertType] = now;
-    setActiveAlert({ id: now, type: alertType, title, message });
+    alertCooldownsRef.current[type] = now;
+    setActiveAlert({ id: now, type, title, message });
+    await playReminderSound(sound);
   };
 
   const dismissSmartAlert = () => setActiveAlert(null);
 
-  const formatTime = (date) => {
-    if (!date) return 'Never';
-    return new Date(date).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-  };
+  const formatTime = (date) =>
+    date
+      ? new Date(date).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+      : 'Never';
 
   const formatShortTime = (timestamp) =>
     new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
+  const formatDuration = (seconds) => {
+    const safe = Math.max(0, Math.round(seconds));
+    const mins = Math.floor(safe / 60);
+    const secs = safe % 60;
+    return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+  };
+
   const getCurrentStatus = (analysis) => {
     if (!analysis) return 'Waiting for analysis';
-    if (analysis.person_visible === false) return 'No Person Detected';
-    if (analysis.slouching === true) return 'Posture Reminder';
-    if (analysis.slouching === false) return 'Good Posture';
+    if (analysis.person_visible === false) return 'Not at desk';
+    if (analysis.eyes === 'closed') return 'Possible fatigue';
+    if (analysis.slouching === true) return 'Posture reminder';
+    if (analysis.slouching === false) return 'Good posture';
     return 'Waiting for analysis';
   };
 
-  const getEyeStatus = (analysis) => {
-    if (analysis?.eyes === 'closed') return 'Eyes appear closed';
-    if (analysis?.eyes === 'open') return 'Eyes open';
-    return 'Unknown';
-  };
-
-  const getHeadStatus = (analysis) => {
-    if (!analysis?.head_position) return 'Unknown';
-    return String(analysis.head_position).replace(/_/g, ' ');
-  };
-
   const getRecommendation = (analysis) => {
-    if (!analysis) return 'Start the camera and run an analysis to see your latest visual ergonomics status.';
-    if (analysis.person_visible === false) return 'Make sure you are visible in the camera frame.';
-    if (analysis.slouching === true) return 'Try sitting a little more upright and relaxing your shoulders.';
-    if (analysis.eyes === 'closed') return 'Your eyes appear closed. Consider taking a short break if you feel tired.';
-    return 'Your latest visual check looks comfortable. Keep it up.';
+    if (!analysis) return 'Start a focus session and the AI will begin checking your workspace.';
+    if (analysis.person_visible === false) return 'Return to your workspace when you are ready.';
+    if (analysis.eyes === 'closed') return 'Take a short eye break and come back refreshed.';
+    if (analysis.slouching === true) return 'Sit a little taller, relax your shoulders and continue.';
+    return 'You look ready. Keep working at a comfortable pace.';
   };
 
   const currentStatus = getCurrentStatus(capturedResult);
-  const eyeStatus = getEyeStatus(capturedResult);
-  const headStatus = getHeadStatus(capturedResult);
   const recommendation = getRecommendation(capturedResult);
-
-  const statusTone =
-    currentStatus === 'Good Posture'
-      ? 'success'
-      : currentStatus === 'Posture Reminder'
-        ? 'warning'
-        : currentStatus === 'No Person Detected'
-          ? 'neutral'
-          : 'info';
+  const eyeStatus = capturedResult?.eyes === 'closed'
+    ? 'Eyes closed'
+    : capturedResult?.eyes === 'open'
+      ? 'Eyes open'
+      : 'Unknown';
+  const headStatus = capturedResult?.head_position
+    ? String(capturedResult.head_position).replace(/_/g, ' ')
+    : 'Unknown';
 
   const runMonitoringAnalysis = async () => {
     if (!monitoringRef.current || !cameraRunning || !webcamRef.current || analysisInProgressRef.current) return;
-
     const imageData = captureCurrentFrame();
     if (!imageData) {
       setMonitorStatus('Error');
-      setError('Monitoring could not capture a frame from the webcam.');
+      setError('Monitoring could not capture a webcam frame.');
       return;
     }
 
@@ -321,21 +432,21 @@ function App() {
       setCapturedResult(data);
       setLastAnalysisTime(new Date());
       addAnalysisToHistory(data);
-      maybeShowSmartAlert(data);
+      await showSmartAlert(data);
       setMonitorStatus('Complete');
       setAiStatus('connected');
     } catch (err) {
-      console.error('Monitoring analysis error:', err);
+      console.error(err);
       setMonitorStatus('Error');
       setAiStatus('disconnected');
-      setError(err.message || 'The latest frame could not be analyzed. Your previous successful result has been kept.');
+      setError(err.message || 'The latest frame could not be analyzed.');
     } finally {
       analysisInProgressRef.current = false;
     }
   };
 
   useEffect(() => {
-    if (!monitoring || !cameraRunning) {
+    if (!monitoring || !cameraRunning || !currentMode.checks) {
       if (monitoringIntervalRef.current) clearInterval(monitoringIntervalRef.current);
       if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
       monitoringIntervalRef.current = null;
@@ -346,11 +457,7 @@ function App() {
 
     runMonitoringAnalysis();
 
-    const scheduleNext = () => {
-      const target = Date.now() + MONITOR_INTERVAL;
-      setNextAnalysisAt(target);
-    };
-
+    const scheduleNext = () => setNextAnalysisAt(Date.now() + MONITOR_INTERVAL);
     scheduleNext();
 
     monitoringIntervalRef.current = setInterval(() => {
@@ -359,7 +466,7 @@ function App() {
     }, MONITOR_INTERVAL);
 
     countdownIntervalRef.current = setInterval(() => {
-      setNextAnalysisAt((current) => (current ? current : null));
+      setNextAnalysisAt((current) => current);
     }, 1000);
 
     return () => {
@@ -368,11 +475,10 @@ function App() {
       monitoringIntervalRef.current = null;
       countdownIntervalRef.current = null;
     };
-  }, [monitoring, cameraRunning]);
+  }, [monitoring, cameraRunning, mode]);
 
-  const handleStartMonitoring = async () => {
+  const startMonitoring = async () => {
     if (monitoringRef.current) return;
-
     monitoringRef.current = true;
     resetAlertCooldowns();
     setActiveAlert(null);
@@ -385,45 +491,144 @@ function App() {
     }
   };
 
-  const handleStopMonitoring = () => {
+  const stopMonitoring = () => {
     monitoringRef.current = false;
     resetAlertCooldowns();
     setActiveAlert(null);
     setMonitoring(false);
     setMonitorStatus('Waiting');
     setNextAnalysisAt(null);
-
     if (monitoringIntervalRef.current) clearInterval(monitoringIntervalRef.current);
     if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
     monitoringIntervalRef.current = null;
     countdownIntervalRef.current = null;
   };
 
-  const handleCaptureImage = () => {
-    if (!cameraRunning) {
-      setError('Start the camera before capturing an image.');
-      return;
+  const enterFullscreen = async () => {
+    try {
+      if (!document.fullscreenElement) {
+        await document.documentElement.requestFullscreen?.();
+        setFullscreenStudy(true);
+      } else {
+        await document.exitFullscreen?.();
+        setFullscreenStudy(false);
+      }
+    } catch {
+      setError('Fullscreen is not available in this browser.');
+    }
+  };
+
+  const changeMode = (nextMode) => {
+    if (sessionActive) return;
+    setMode(nextMode);
+    setSessionMinutes(MODES[nextMode].minutes);
+    setTiredLevel(0);
+  };
+
+  const startSession = async () => {
+    if (sessionActive) return;
+    await ensureAudio();
+    setError(null);
+    const seconds = sessionMinutes * 60;
+    setSessionSecondsLeft(seconds);
+    setSessionStartedAt(new Date());
+    setSessionActive(true);
+    setTiredLevel(0);
+
+    if (mode === 'study') {
+      await enterFullscreen();
     }
 
+    if (currentMode.checks) {
+      await startMonitoring();
+    }
+    await playReminderSound('focus');
+  };
+
+  const finishSession = (completed = true) => {
+    const started = sessionStartedRef.current;
+    const elapsed = started ? Math.max(0, Math.round((Date.now() - new Date(started).getTime()) / 1000)) : 0;
+
+    if (started) {
+      const points = Math.max(1, Math.round(elapsed / 60));
+      setFocusPoints((previous) => previous + points);
+      setSessionLog((previous) => [
+        {
+          startedAt: started,
+          endedAt: new Date(),
+          duration: elapsed,
+          mode,
+          completed,
+          tired: tiredLevel,
+        },
+        ...previous,
+      ].slice(0, 30));
+    }
+
+    setSessionActive(false);
+    setSessionSecondsLeft(0);
+    setSessionStartedAt(null);
+    stopMonitoring();
+    playReminderSound(completed ? 'focus' : 'gentle');
+
+    if (fullscreenStudy && document.fullscreenElement) {
+      document.exitFullscreen?.().catch(() => {});
+    }
+    setFullscreenStudy(false);
+
+    if (completed) setCompletedSessions((previous) => previous + 1);
+  };
+
+  useEffect(() => {
+    if (!sessionActive) {
+      if (sessionIntervalRef.current) clearInterval(sessionIntervalRef.current);
+      sessionIntervalRef.current = null;
+      return undefined;
+    }
+
+    sessionIntervalRef.current = setInterval(() => {
+      setSessionSecondsLeft((previous) => {
+        if (previous <= 1) {
+          setTimeout(() => finishSession(true), 0);
+          return 0;
+        }
+        return previous - 1;
+      });
+    }, 1000);
+
+    return () => {
+      if (sessionIntervalRef.current) clearInterval(sessionIntervalRef.current);
+      sessionIntervalRef.current = null;
+    };
+  }, [sessionActive]);
+
+  useEffect(() => {
+    const onFullscreenChange = () => {
+      if (!document.fullscreenElement) setFullscreenStudy(false);
+    };
+    document.addEventListener('fullscreenchange', onFullscreenChange);
+    return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
+  }, []);
+
+  const handleCaptureImage = () => {
+    if (!cameraRunning) {
+      setError('Start the camera before capturing a frame.');
+      return;
+    }
     const imageSrc = captureCurrentFrame();
     if (!imageSrc) {
       setError('Could not capture an image from the camera.');
       return;
     }
-
     setError(null);
     setCapturedImage(imageSrc);
     setCapturedResult(null);
   };
 
   const handleAnalyzeCapturedImage = async () => {
-    if (!capturedImage) {
-      setError('Capture an image before analyzing it.');
-      return;
-    }
-
+    if (!capturedImage) return;
     if (analysisInProgressRef.current) {
-      setError('Another image analysis is already running. Please wait.');
+      setError('Another image analysis is already running.');
       return;
     }
 
@@ -439,7 +644,7 @@ function App() {
       setAiStatus('connected');
     } catch (err) {
       setAiStatus('disconnected');
-      setError(err.message || 'An error occurred while analyzing the captured image.');
+      setError(err.message || 'Could not analyze the captured image.');
     } finally {
       analysisInProgressRef.current = false;
       setCapturedAnalyzing(false);
@@ -449,15 +654,12 @@ function App() {
   const handleImageSelect = (event) => {
     const file = event.target.files?.[0];
     if (!file) return;
-
     if (!file.type.startsWith('image/')) {
       setError('Please select an image file.');
       return;
     }
-
     setError(null);
     setResult(null);
-
     const reader = new FileReader();
     reader.onload = () => setSelectedImage(reader.result);
     reader.onerror = () => setError('Failed to read the selected file.');
@@ -466,19 +668,17 @@ function App() {
 
   const handleAnalyze = async () => {
     if (!selectedImage || analysisInProgressRef.current) return;
-
     analysisInProgressRef.current = true;
     setLoading(true);
     setError(null);
     setResult(null);
-
     try {
       const data = await analyzeImage(selectedImage);
       setResult(data);
       setAiStatus('connected');
     } catch (err) {
       setAiStatus('disconnected');
-      setError(err.message || 'An error occurred while contacting the local vision server.');
+      setError(err.message || 'Could not contact the local vision server.');
     } finally {
       analysisInProgressRef.current = false;
       setLoading(false);
@@ -487,28 +687,22 @@ function App() {
 
   const handleTestConnection = async () => {
     if (aiTesting) return;
-
     setAiTesting(true);
     setAiStatus('checking');
     setError(null);
-
     try {
       const controller = new AbortController();
       aiTestControllerRef.current = controller;
-
       const response = await fetch('http://127.0.0.1:8888/v1/models', {
         method: 'GET',
         signal: controller.signal,
       });
-
       if (!response.ok) throw new Error(`Local AI server returned HTTP ${response.status}.`);
-
       setAiStatus('connected');
     } catch (err) {
       if (err.name !== 'AbortError') {
-        console.error('AI connection test failed:', err);
         setAiStatus('disconnected');
-        setError('AI engine is not reachable. Make sure Unsloth Studio is running and the model is loaded.');
+        setError('AI engine is not reachable. Start Unsloth Studio and load the model.');
       }
     } finally {
       aiTestControllerRef.current = null;
@@ -516,13 +710,10 @@ function App() {
     }
   };
 
-  const handleClearHistory = () => setAnalysisHistory([]);
-
-  const checksToday = analysisHistory.filter((entry) => {
-    const date = new Date(entry.timestamp);
-    const now = new Date();
-    return date.toDateString() === now.toDateString();
-  }).length;
+  const checksToday = useMemo(() => {
+    const today = new Date().toDateString();
+    return analysisHistory.filter((entry) => new Date(entry.timestamp).toDateString() === today).length;
+  }, [analysisHistory]);
 
   const goodPostureCount = analysisHistory.filter(
     (entry) => entry.person_visible === true && entry.slouching === false
@@ -530,39 +721,57 @@ function App() {
 
   const reminderCount = analysisHistory.filter((entry) => entry.slouching === true).length;
 
+  const focusRate = analysisHistory.length
+    ? Math.round((goodPostureCount / analysisHistory.length) * 100)
+    : 0;
+
   const countdownSeconds = nextAnalysisAt
     ? Math.max(0, Math.ceil((nextAnalysisAt - Date.now()) / 1000))
     : null;
 
+  const sessionProgress = sessionActive
+    ? Math.max(0, Math.min(100, 100 - (sessionSecondsLeft / (sessionMinutes * 60)) * 100))
+    : 0;
+
   const getHistoryStatus = (entry) => {
-    if (entry.person_visible === false) return ['No Person', 'neutral'];
-    if (entry.slouching === true) return ['Posture Reminder', 'warning'];
-    if (entry.slouching === false) return ['Good Posture', 'success'];
+    if (entry.person_visible === false) return ['Not at desk', 'neutral'];
+    if (entry.eyes === 'closed') return ['Possible fatigue', 'warning'];
+    if (entry.slouching === true) return ['Posture reminder', 'warning'];
+    if (entry.slouching === false) return ['Good posture', 'success'];
     return ['Unknown', 'neutral'];
   };
 
+  const tiredLabel =
+    tiredLevel >= 75 ? 'Very tired' :
+    tiredLevel >= 50 ? 'Getting tired' :
+    tiredLevel >= 25 ? 'Slight fatigue' : 'Fresh';
+
+  const statusTone =
+    currentStatus === 'Good posture'
+      ? 'success'
+      : currentStatus === 'Posture reminder' || currentStatus === 'Possible fatigue'
+        ? 'warning'
+        : currentStatus === 'Not at desk'
+          ? 'neutral'
+          : 'info';
+
   return (
-    <div className="app-shell">
+    <div className={`app-shell mode-${mode} ${sessionActive ? 'session-live' : ''}`}>
       <header className="topbar">
         <div className="brand">
           <div className="brand-mark">E</div>
           <div>
-            <div className="brand-name">ErgoAI</div>
-            <div className="brand-subtitle">Real-Time Ergonomics Monitor</div>
+            <div className="brand-name">ErgoAI Focus</div>
+            <div className="brand-subtitle">AI-assisted focus & workspace awareness</div>
           </div>
         </div>
 
         <div className="topbar-actions">
           <div className={`system-pill ${aiStatus}`}>
             <span className="status-dot" />
-            {aiStatus === 'connected' ? 'AI Connected' : aiStatus === 'checking' ? 'Checking AI' : 'AI Disconnected'}
+            {aiStatus === 'connected' ? 'AI Connected' : aiStatus === 'checking' ? 'Checking AI' : 'AI Offline'}
           </div>
-
-          <button
-            className="theme-toggle"
-            onClick={() => setTheme((current) => (current === 'dark' ? 'light' : 'dark'))}
-            aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
-          >
+          <button className="theme-toggle" onClick={() => setTheme((v) => v === 'dark' ? 'light' : 'dark')}>
             <span className="theme-icon">{theme === 'dark' ? '☀' : '☾'}</span>
             {theme === 'dark' ? 'Light' : 'Dark'}
           </button>
@@ -572,28 +781,27 @@ function App() {
       <main className="dashboard">
         <section className="hero">
           <div>
-            <p className="eyebrow">LOCAL AI · PRIVATE BY DESIGN</p>
-            <h1>Stay aware.<br /><span>Stay comfortable.</span></h1>
+            <p className="eyebrow">FOCUS ENGINE · LOCAL AI</p>
+            <h1>Don't just monitor.<br /><span>Help me focus.</span></h1>
             <p className="hero-copy">
-              A local AI workspace that periodically checks visible ergonomics cues and gives simple, non-medical reminders.
+              ErgoAI turns webcam observations into practical focus interventions: scheduled sessions, gentle sound reminders, fatigue signals, and workspace tracking.
             </p>
           </div>
-
-          <div className={`hero-monitor ${monitoring ? 'is-active' : ''}`}>
+          <div className={`hero-monitor ${monitoring || sessionActive ? 'is-active' : ''}`}>
             <span className="status-dot" />
-            {monitoring ? 'Monitoring Active' : 'Monitoring Paused'}
+            {sessionActive ? `${currentMode.name} session active` : 'Ready for a session'}
           </div>
         </section>
 
         {activeAlert && (
-          <section className="alert-card" role="status">
+          <section className={`alert-card smart-alert ${activeAlert.type}`}>
             <div className="alert-icon">!</div>
             <div className="alert-content">
               <div className="alert-title">{activeAlert.title}</div>
               <div className="alert-message">{activeAlert.message}</div>
-              <div className="alert-time">In-app reminder · cooldown protected</div>
+              <div className="alert-time">Intervention · {formatTime(activeAlert.id)}</div>
             </div>
-            <button className="icon-button" onClick={dismissSmartAlert} aria-label="Dismiss reminder">×</button>
+            <button className="button secondary" onClick={dismissSmartAlert}>Got it</button>
           </section>
         )}
 
@@ -608,6 +816,125 @@ function App() {
           </section>
         )}
 
+        <section className="focus-layout">
+          <article className="card focus-card">
+            <div className="card-header">
+              <div>
+                <div className="section-kicker">FOCUS CONTROL</div>
+                <h2>Choose how you want to work</h2>
+              </div>
+              <div className={`state-badge ${sessionActive ? 'active' : ''}`}>
+                <span className="status-dot" /> {sessionActive ? 'Live session' : 'Not running'}
+              </div>
+            </div>
+
+            <div className="mode-grid">
+              {Object.entries(MODES).map(([key, item]) => (
+                <button
+                  key={key}
+                  className={`mode-card ${mode === key ? 'selected' : ''}`}
+                  onClick={() => changeMode(key)}
+                  disabled={sessionActive}
+                >
+                  <span className={`mode-icon ${item.accent}`}>{key === 'study' ? 'S' : key === 'focus' ? 'F' : 'C'}</span>
+                  <strong>{item.name}</strong>
+                  <small>{item.description}</small>
+                  <span className="mode-time">{item.minutes} min</span>
+                </button>
+              ))}
+            </div>
+
+            <div className="session-control">
+              <div className="timer-ring" style={{ '--progress': `${sessionProgress}%` }}>
+                <div>
+                  <span>{sessionActive ? formatDuration(sessionSecondsLeft) : `${sessionMinutes}:00`}</span>
+                  <small>{sessionActive ? 'remaining' : 'session'}</small>
+                </div>
+              </div>
+
+              <div className="session-copy">
+                <span className="section-kicker">{currentMode.name.toUpperCase()} MODE</span>
+                <h3>{sessionActive ? 'Stay with the task.' : 'Make your next block count.'}</h3>
+                <p>{currentMode.description}</p>
+                <div className="session-buttons">
+                  {!sessionActive ? (
+                    <button className="button primary large" onClick={startSession}>Start {currentMode.name} Session</button>
+                  ) : (
+                    <button className="button danger large" onClick={() => finishSession(false)}>End Session</button>
+                  )}
+                  <button className="ghost-button large" onClick={() => setSoundEnabled((v) => !v)}>
+                    {soundEnabled ? 'Sound reminders on' : 'Sound reminders off'}
+                  </button>
+                  {mode === 'study' && (
+                    <button className="ghost-button large" onClick={enterFullscreen}>
+                      {fullscreenStudy ? 'Exit fullscreen' : 'Enter fullscreen'}
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <div className="session-settings">
+              <label>
+                <span>Session length</span>
+                <select value={sessionMinutes} disabled={sessionActive} onChange={(e) => setSessionMinutes(Number(e.target.value))}>
+                  <option value={15}>15 minutes</option>
+                  <option value={25}>25 minutes</option>
+                  <option value={30}>30 minutes</option>
+                  <option value={45}>45 minutes</option>
+                  <option value={50}>50 minutes</option>
+                  <option value={60}>60 minutes</option>
+                  <option value={90}>90 minutes</option>
+                </select>
+              </label>
+              <label>
+                <span>Reminder volume</span>
+                <input type="range" min="0.05" max="1" step="0.05" value={soundVolume} onChange={(e) => setSoundVolume(Number(e.target.value))} />
+              </label>
+            </div>
+
+            <div className="study-note">
+              <strong>Study mode notice</strong>
+              <span>Browser security limits prevent full OS-level locking of mobile devices or other desktop applications. Study Mode enforces full-screen display, desk presence monitoring, and instant sound alerts on this browser environment.</span>
+            </div>
+          </article>
+
+          <aside className="card tired-card">
+            <div className="card-header">
+              <div>
+                <div className="section-kicker">TIREDNESS SIGNAL</div>
+                <h2>How are you holding up?</h2>
+              </div>
+              <span className={`tired-badge level-${Math.round(tiredLevel / 25)}`}>{tiredLabel}</span>
+            </div>
+
+            <div className="tired-meter">
+              <div className="meter-head">
+                <strong>{tiredLevel}%</strong>
+                <span>AI estimate</span>
+              </div>
+              <div className="meter-track"><div className="meter-fill" style={{ width: `${tiredLevel}%` }} /></div>
+              <div className="meter-labels"><span>Fresh</span><span>Take a break</span></div>
+            </div>
+
+            <p className="muted">Cues like closed eyes, head slouching, or missing presence increment this value. Use it as a gentle signal to pause or stretch.</p>
+
+            <div className="energy-question">
+              <span>Quick self-check</span>
+              <strong>How much energy do you feel?</strong>
+              <input type="range" min="0" max="100" value={selfEnergy} onChange={(e) => setSelfEnergy(Number(e.target.value))} />
+              <div className="energy-row"><span>Low</span><strong>{selfEnergy}%</strong><span>High</span></div>
+            </div>
+
+            <button className="button secondary full" onClick={() => {
+              setTiredLevel(0);
+              playReminderSound('gentle');
+            }}>
+              Reset tiredness signal
+            </button>
+          </aside>
+        </section>
+
         <section className="primary-grid">
           <article className="card camera-card">
             <div className="card-header">
@@ -616,8 +943,7 @@ function App() {
                 <h2>Workspace view</h2>
               </div>
               <div className={`live-badge ${cameraRunning ? 'on' : ''}`}>
-                <span className="status-dot" />
-                {cameraRunning ? 'LIVE' : 'OFFLINE'}
+                <span className="status-dot" /> {cameraRunning ? 'LIVE' : 'OFFLINE'}
               </div>
             </div>
 
@@ -626,18 +952,12 @@ function App() {
                 <div className="camera-empty">
                   <div className="empty-icon">CAM</div>
                   <strong>Camera is paused</strong>
-                  <span>Start the camera to begin visual monitoring.</span>
+                  <span>Start it when you want AI-assisted focus interventions.</span>
                 </div>
               )}
-
               {cameraStarting && (
-                <div className="camera-empty">
-                  <div className="pulse-loader" />
-                  <strong>Starting camera...</strong>
-                  <span>Waiting for browser camera access.</span>
-                </div>
+                <div className="camera-empty"><div className="pulse-loader" /><strong>Starting camera...</strong><span>Waiting for browser permission.</span></div>
               )}
-
               {(cameraRunning || cameraStarting) && selectedCameraId && (
                 <Webcam
                   ref={webcamRef}
@@ -645,67 +965,35 @@ function App() {
                   mirrored
                   screenshotFormat="image/jpeg"
                   screenshotQuality={0.92}
-                  videoConstraints={{
-                    deviceId: selectedCameraId,
-                    width: { ideal: 1280 },
-                    height: { ideal: 720 },
-                  }}
+                  videoConstraints={{ deviceId: selectedCameraId, width: { ideal: 1280 }, height: { ideal: 720 } }}
                   onUserMedia={handleCameraReady}
                   onUserMediaError={handleCameraError}
                   className="webcam"
                 />
               )}
-
               {cameraRunning && (
                 <div className="camera-overlay">
                   <span className="overlay-chip">LOCAL CAMERA</span>
-                  <span className="overlay-chip">AI READY</span>
+                  <span className="overlay-chip">{monitoring ? 'AI MONITORING' : 'READY'}</span>
                 </div>
               )}
             </div>
 
             <div className="camera-meta">
               <label htmlFor="camera-select">Camera source</label>
-              <select
-                id="camera-select"
-                className="camera-select"
-                value={selectedCameraId}
-                onChange={handleCameraChange}
-                disabled={cameraRunning || cameraStarting}
-              >
-                {cameras.length === 0 ? (
-                  <option value="">Start camera to detect devices</option>
-                ) : (
-                  cameras.map((camera, index) => (
-                    <option key={camera.deviceId} value={camera.deviceId}>
-                      {camera.label || `Camera ${index + 1}`}
-                    </option>
-                  ))
-                )}
+              <select id="camera-select" className="camera-select" value={selectedCameraId} onChange={handleCameraChange} disabled={cameraRunning || cameraStarting}>
+                {cameras.length === 0 ? <option value="">Start camera to detect devices</option> : cameras.map((camera, index) => (
+                  <option key={camera.deviceId} value={camera.deviceId}>{camera.label || `Camera ${index + 1}`}</option>
+                ))}
               </select>
             </div>
 
             <div className="button-row">
-              <button
-                className="button primary large"
-                onClick={handleStartCamera}
-                disabled={cameraRunning || cameraStarting || !selectedCameraId}
-              >
-                {cameraStarting ? 'Starting...' : 'Start Camera'}
-              </button>
-              <button
-                className="button secondary large"
-                onClick={handleStopCamera}
-                disabled={!cameraRunning && !cameraStarting}
-              >
-                Stop Camera
-              </button>
-              <button
-                className="button secondary large"
-                onClick={handleCaptureImage}
-                disabled={!cameraRunning}
-              >
-                Capture Frame
+              <button className="button primary large" onClick={handleStartCamera} disabled={cameraRunning || cameraStarting || !selectedCameraId}>{cameraStarting ? 'Starting...' : 'Start Camera'}</button>
+              <button className="button secondary large" onClick={handleStopCamera} disabled={!cameraRunning && !cameraStarting}>Stop Camera</button>
+              <button className="button secondary large" onClick={handleCaptureImage} disabled={!cameraRunning}>Capture Frame</button>
+              <button className={`button ${monitoring ? 'danger' : 'secondary'} large`} onClick={monitoring ? stopMonitoring : startMonitoring} disabled={!cameraRunning && !cameraStarting}>
+                {monitoring ? 'Stop AI Monitoring' : 'Start AI Monitoring'}
               </button>
             </div>
           </article>
@@ -713,23 +1001,13 @@ function App() {
           <article className={`card status-card status-${statusTone}`}>
             <div className="card-header">
               <div>
-                <div className="section-kicker">CURRENT STATUS</div>
-                <h2>AI observation</h2>
+                <div className="section-kicker">LIVE INSIGHT</div>
+                <h2>What should you do now?</h2>
               </div>
-              <div className={`status-symbol ${statusTone}`}>
-                {statusTone === 'success' ? '✓' : statusTone === 'warning' ? '!' : '•'}
-              </div>
+              <div className={`status-symbol ${statusTone}`}>{statusTone === 'success' ? '✓' : statusTone === 'warning' ? '!' : '•'}</div>
             </div>
 
-            {monitorStatus === 'Analyzing' && (
-              <div className="analysis-loading">
-                <span className="pulse-loader" />
-                <div>
-                  <strong>AI analyzing</strong>
-                  <span>Reviewing the latest camera frame...</span>
-                </div>
-              </div>
-            )}
+            {monitorStatus === 'Analyzing' && <div className="analysis-loading"><span className="pulse-loader" /><div><strong>AI analyzing</strong><span>Reviewing the latest frame...</span></div></div>}
 
             <div className="status-main">
               <div className="status-label">{currentStatus}</div>
@@ -737,158 +1015,37 @@ function App() {
             </div>
 
             <div className="metric-grid">
-              <div className="metric">
-                <span>POSTURE</span>
-                <strong>{capturedResult?.slouching === false ? 'Good' : capturedResult?.slouching === true ? 'Reminder' : 'Unknown'}</strong>
-              </div>
-              <div className="metric">
-                <span>EYES</span>
-                <strong>{eyeStatus}</strong>
-              </div>
-              <div className="metric">
-                <span>HEAD</span>
-                <strong>{headStatus}</strong>
-              </div>
-              <div className="metric">
-                <span>LAST CHECK</span>
-                <strong>{formatTime(lastAnalysisTime)}</strong>
-              </div>
+              <div className="metric"><span>POSTURE</span><strong>{capturedResult?.slouching === false ? 'Good' : capturedResult?.slouching === true ? 'Reminder' : 'Unknown'}</strong></div>
+              <div className="metric"><span>EYES</span><strong>{eyeStatus}</strong></div>
+              <div className="metric"><span>HEAD</span><strong>{headStatus}</strong></div>
+              <div className="metric"><span>LAST CHECK</span><strong>{formatTime(lastAnalysisTime)}</strong></div>
             </div>
 
-            <div className="recommendation">
-              <div className="recommendation-label">RECOMMENDATION</div>
-              <p>{recommendation}</p>
+            <div className="monitor-details">
+              <div><span>INTERVAL</span><strong>{currentMode.checks ? '10 sec' : 'Off'}</strong></div>
+              <div><span>STATUS</span><strong>{monitorStatus}</strong></div>
+              <div><span>NEXT CHECK</span><strong>{monitoring && countdownSeconds !== null ? `${countdownSeconds}s` : '—'}</strong></div>
             </div>
+
+            <div className="recommendation"><div className="recommendation-label">INTERVENTION</div><p>{recommendation}</p></div>
           </article>
         </section>
 
         <section className="stats-grid">
-          <div className="stat-card">
-            <span>CHECKS TODAY</span>
-            <strong>{checksToday}</strong>
-            <small>Session history</small>
-          </div>
-          <div className="stat-card">
-            <span>GOOD POSTURE</span>
-            <strong>{goodPostureCount}</strong>
-            <small>Positive observations</small>
-          </div>
-          <div className="stat-card">
-            <span>REMINDERS</span>
-            <strong>{reminderCount}</strong>
-            <small>Posture observations</small>
-          </div>
-          <div className="stat-card">
-            <span>LAST CHECK</span>
-            <strong className="stat-time">{formatTime(lastAnalysisTime)}</strong>
-            <small>{lastAnalysisTime ? 'Latest successful analysis' : 'No analysis yet'}</small>
-          </div>
-        </section>
-
-        <section className="control-grid">
-          <article className="card monitoring-card">
-            <div className="card-header">
-              <div>
-                <div className="section-kicker">AUTOMATION</div>
-                <h2>Continuous monitoring</h2>
-              </div>
-              <div className={`state-badge ${monitoring ? 'active' : ''}`}>
-                <span className="status-dot" />
-                {monitoring ? 'Active' : 'Paused'}
-              </div>
-            </div>
-
-            <p className="muted">
-              The app captures a frame and sends it to your local model every 10 seconds. Requests never overlap.
-            </p>
-
-            <div className="monitor-details">
-              <div>
-                <span>INTERVAL</span>
-                <strong>10 seconds</strong>
-              </div>
-              <div>
-                <span>STATUS</span>
-                <strong>{monitorStatus}</strong>
-              </div>
-              <div>
-                <span>NEXT CHECK</span>
-                <strong>{monitoring && countdownSeconds !== null ? `${countdownSeconds}s` : '—'}</strong>
-              </div>
-            </div>
-
-            <div className="button-row">
-              <button className="button primary large" onClick={handleStartMonitoring} disabled={monitoring}>
-                Start Monitoring
-              </button>
-              <button className="button secondary large" onClick={handleStopMonitoring} disabled={!monitoring}>
-                Stop Monitoring
-              </button>
-              <button className="ghost-button" onClick={runMonitoringAnalysis} disabled={!cameraRunning || analysisInProgressRef.current}>
-                Analyze Now
-              </button>
-            </div>
-          </article>
-
-          <article className="card system-card">
-            <div className="card-header">
-              <div>
-                <div className="section-kicker">SYSTEM</div>
-                <h2>Connection status</h2>
-              </div>
-              <button className="ghost-button" onClick={handleTestConnection} disabled={aiTesting}>
-                {aiTesting ? 'Checking...' : 'Test AI'}
-              </button>
-            </div>
-
-            <div className="system-list">
-              <div className="system-row">
-                <span>AI ENGINE</span>
-                <strong className={aiStatus}>
-                  <i className="status-dot" />
-                  {aiStatus === 'connected' ? 'Connected' : aiStatus === 'checking' ? 'Checking...' : 'Disconnected'}
-                </strong>
-              </div>
-              <div className="system-row">
-                <span>CAMERA</span>
-                <strong className={cameraRunning ? 'connected' : 'disconnected'}>
-                  <i className="status-dot" />
-                  {cameraRunning ? 'Ready' : 'Off'}
-                </strong>
-              </div>
-              <div className="system-row">
-                <span>MONITORING</span>
-                <strong className={monitoring ? 'connected' : 'disconnected'}>
-                  <i className="status-dot" />
-                  {monitoring ? 'Active' : 'Paused'}
-                </strong>
-              </div>
-            </div>
-
-            <div className="local-note">
-              <strong>Local AI processing</strong>
-              <p>Camera frames are analyzed using the AI model running on this computer.</p>
-            </div>
-          </article>
+          <div className="stat-card"><span>FOCUS POINTS</span><strong>{focusPoints}</strong><small>Minutes invested</small></div>
+          <div className="stat-card"><span>SESSIONS DONE</span><strong>{completedSessions}</strong><small>Completed focus blocks</small></div>
+          <div className="stat-card"><span>AI CHECKS TODAY</span><strong>{checksToday}</strong><small>Workspace observations</small></div>
+          <div className="stat-card"><span>POSTURE RATE</span><strong>{focusRate}%</strong><small>{reminderCount} reminders recorded</small></div>
         </section>
 
         {capturedImage && (
           <section className="card captured-card">
-            <div className="card-header">
-              <div>
-                <div className="section-kicker">LATEST FRAME</div>
-                <h2>Captured image</h2>
-              </div>
-              {capturedAnalyzing && <span className="state-badge active">Analyzing</span>}
-            </div>
-
+            <div className="card-header"><div><div className="section-kicker">CAPTURED FRAME</div><h2>One-time AI check</h2></div></div>
             <div className="captured-content">
               <img src={capturedImage} alt="Latest captured frame" />
               <div className="captured-actions">
-                <p className="muted">Use this frame for a one-time local AI analysis without starting continuous monitoring.</p>
-                <button className="button primary" onClick={handleAnalyzeCapturedImage} disabled={capturedAnalyzing}>
-                  {capturedAnalyzing ? 'Analyzing image...' : 'Analyze Captured Image'}
-                </button>
+                <p className="muted">Analyze this frame without starting a continuous loop.</p>
+                <button className="button primary" onClick={handleAnalyzeCapturedImage} disabled={capturedAnalyzing}>{capturedAnalyzing ? 'Analyzing...' : 'Analyze Captured Image'}</button>
               </div>
             </div>
           </section>
@@ -896,21 +1053,12 @@ function App() {
 
         <section className="card history-card">
           <div className="card-header">
-            <div>
-              <div className="section-kicker">SESSION HISTORY</div>
-              <h2>Recent AI observations</h2>
-            </div>
-            <button className="ghost-button" onClick={handleClearHistory} disabled={!analysisHistory.length}>
-              Clear History
-            </button>
+            <div><div className="section-kicker">MEMORY OF YOUR WORK</div><h2>Recent observations</h2></div>
+            <button className="ghost-button" onClick={() => setAnalysisHistory([])} disabled={!analysisHistory.length}>Clear History</button>
           </div>
 
           {analysisHistory.length === 0 ? (
-            <div className="empty-state compact">
-              <div className="empty-icon">LOG</div>
-              <strong>No analysis history yet</strong>
-              <span>Start monitoring to build your session timeline.</span>
-            </div>
+            <div className="empty-state compact"><div className="empty-icon">LOG</div><strong>No observations yet</strong><span>Start a focus session to build your timeline.</span></div>
           ) : (
             <div className="history-list">
               {analysisHistory.map((entry, index) => {
@@ -918,16 +1066,10 @@ function App() {
                 return (
                   <details className="history-item" key={`${entry.timestamp}-${index}`}>
                     <summary>
-                      <span className={`history-marker ${historyTone}`}>
-                        {historyTone === 'success' ? '✓' : historyTone === 'warning' ? '!' : '•'}
-                      </span>
+                      <span className={`history-marker ${historyTone}`}>{historyTone === 'success' ? '✓' : historyTone === 'warning' ? '!' : '•'}</span>
                       <span className="history-time">{formatShortTime(entry.timestamp)}</span>
                       <span className="history-status">{historyStatus}</span>
-                      <span className="history-meta">
-                        {entry.eyes === 'open' ? 'Eyes open' : entry.eyes === 'closed' ? 'Eyes closed' : 'Eyes unknown'}
-                        {' · '}
-                        {entry.head_position || 'Head unknown'}
-                      </span>
+                      <span className="history-meta">{entry.eyes || 'Eyes unknown'} · {entry.head_position || 'Head unknown'}</span>
                       <span className="history-chevron">›</span>
                     </summary>
                     <div className="history-details">
@@ -945,45 +1087,28 @@ function App() {
         </section>
 
         <section className="card quick-card">
-          <div className="card-header">
-            <div>
-              <div className="section-kicker">QUICK ANALYSIS</div>
-              <h2>Test a single image</h2>
-            </div>
-            <span className="state-badge">One-time</span>
+          <div className="card-header"><div><div className="section-kicker">QUICK ANALYSIS</div><h2>Test a single image</h2></div><span className="state-badge">One-time</span></div>
+          <p className="muted">Upload an image file to run a manual analysis with the local AI service.</p>
+          <div className="upload-row">
+            <label className="upload-button"><input type="file" accept="image/*" onChange={handleImageSelect} />Choose image</label>
+            {selectedImage && <button className="button primary" onClick={handleAnalyze} disabled={loading}>{loading ? 'Analyzing...' : 'Analyze Image'}</button>}
           </div>
+          {selectedImage && <img className="upload-preview" src={selectedImage} alt="Selected preview" />}
+          {result && <pre className="json-result">{JSON.stringify(result, null, 2)}</pre>}
+        </section>
 
-          <p className="muted">Upload an image for a one-off analysis. This uses the same local AI service as live monitoring.</p>
-
-          <label className="upload-zone">
-            <input type="file" accept="image/*" onChange={handleImageSelect} />
-            <div className="upload-icon">IMG</div>
-            <strong>{selectedImage ? 'Choose another image' : 'Choose an image'}</strong>
-            <span>PNG, JPG, WEBP · analyzed locally</span>
-          </label>
-
-          {selectedImage && (
-            <div className="quick-preview">
-              <img src={selectedImage} alt="Selected preview" />
-              <div className="quick-actions">
-                <button className="button primary" onClick={handleAnalyze} disabled={loading}>
-                  {loading ? 'Analyzing Image...' : 'Analyze Image'}
-                </button>
-
-                {result && (
-                  <details className="quick-result" open>
-                    <summary>View raw JSON result</summary>
-                    <pre>{JSON.stringify(result, null, 2)}</pre>
-                  </details>
-                )}
-              </div>
-            </div>
-          )}
+        <section className="card system-card">
+          <div>
+            <div className="section-kicker">SYSTEM</div>
+            <h2>Local AI connection</h2>
+            <p className="muted">Vision requests route directly to <code>http://127.0.0.1:8888/v1</code>.</p>
+          </div>
+          <button className="button secondary" onClick={handleTestConnection} disabled={aiTesting}>{aiTesting ? 'Testing...' : 'Test AI Connection'}</button>
         </section>
 
         <footer className="footer-note">
-          <span>ErgoAI · Local visual ergonomics assistant</span>
-          <span>Visual reminders only · Not medical advice</span>
+          <span>ErgoAI Focus · Built around your existing local vision workflow</span>
+          <span>Camera analysis is informational, not medical advice.</span>
         </footer>
       </main>
     </div>
