@@ -3,7 +3,7 @@ const API_URL = 'http://127.0.0.1:8888/v1/chat/completions';
 
 // Keep your Unsloth API token private.
 // Do not upload this token to GitHub or share it publicly.
-const API_TOKEN = 'sk-unsloth-512fa420c6a660231f911e9b746169b2';
+const API_TOKEN = 'your api token here';
 
 const MODEL_NAME = 'unsloth/Qwen3-VL-4B-Instruct-GGUF';
 
